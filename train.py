@@ -48,28 +48,58 @@ def train(args):
     rank = 0
 
     db = dataset_factory(['tartan'], datapath="datasets/TartanAir", n_frames=args.n_frames)
-    train_loader = DataLoader(db, batch_size=1, shuffle=True, num_workers=4)
+    train_loader = DataLoader(db, batch_size=1, shuffle=True, num_workers=0)
 
     net = VONet()
     net.train()
     net.cuda()
 
+    total_steps = 0
+
     if args.ckpt is not None:
-        state_dict = torch.load(args.ckpt)
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            new_state_dict[k.replace('module.', '')] = v
-        net.load_state_dict(new_state_dict, strict=False)
+        checkpoint = torch.load(args.ckpt)
 
-    optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-6)
+        # Old-style checkpoint: plain model state_dict
+        if isinstance(checkpoint, dict) and 'model' not in checkpoint:
+            new_state_dict = OrderedDict()
+            for k, v in checkpoint.items():
+                new_state_dict[k.replace('module.', '')] = v
+            net.load_state_dict(new_state_dict, strict=False)
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, 
-        args.lr, args.steps, pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
+        # New-style checkpoint: full training state
+        else:
+            model_state = checkpoint['model']
+            new_state_dict = OrderedDict()
+            for k, v in model_state.items():
+                new_state_dict[k.replace('module.', '')] = v
+            net.load_state_dict(new_state_dict, strict=False)
+    
+    
+
+        optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-6)
+
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        args.lr,
+        args.steps,
+        pct_start=0.01,
+        cycle_momentum=False,
+        anneal_strategy='linear'
+    )
+
+    if args.ckpt is not None:
+        checkpoint = torch.load(args.ckpt)
+
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            if 'total_steps' in checkpoint:
+                total_steps = checkpoint['total_steps']
 
     if rank == 0:
         logger = Logger(args.name, scheduler)
-
-    total_steps = 0
 
     while 1:
         for data_blob in train_loader:
@@ -141,16 +171,17 @@ def train(args):
             if rank == 0:
                 logger.push(metrics)
 
-            if total_steps % 10000 == 0:
+            if total_steps % 500 == 0:
                 torch.cuda.empty_cache()
 
                 if rank == 0:
                     PATH = 'checkpoints/%s_%06d.pth' % (args.name, total_steps)
-                    torch.save(net.state_dict(), PATH)
-
-                validation_results = validate(None, net)
-                if rank == 0:
-                    logger.write_dict(validation_results)
+                    torch.save({
+                        'model': net.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(),
+                        'total_steps': total_steps,
+                    }, PATH)
 
                 torch.cuda.empty_cache()
                 net.train()

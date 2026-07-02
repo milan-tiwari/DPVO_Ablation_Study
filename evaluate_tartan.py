@@ -96,39 +96,60 @@ def evaluate(config, net, split="validation", trials=1, plot=False, save=False):
                 traj_ref = osp.join("datasets/TartanAir", scene, "pose_left.txt")
 
             # run the slam system
-            traj_est, tstamps = run(scene_path, config, net, viz=False, show_img=False)
+            try:
+                # run the slam system
+                traj_est, tstamps = run(scene_path, config, net, viz=False, show_img=False)
 
-            PERM = [1, 2, 0, 4, 5, 3, 6] # ned -> xyz
-            traj_ref = np.loadtxt(traj_ref, delimiter=" ")[::STRIDE, PERM]
+                PERM = [1, 2, 0, 4, 5, 3, 6] # ned -> xyz
+                traj_ref_data = np.loadtxt(traj_ref, delimiter=" ")[::STRIDE, PERM]
 
-            traj_est = PoseTrajectory3D(
-                positions_xyz=traj_est[:,:3],
-                orientations_quat_wxyz=traj_est[:, [6, 3, 4, 5]],
-                timestamps=tstamps)
+                traj_est = PoseTrajectory3D(
+                    positions_xyz=traj_est[:,:3],
+                    orientations_quat_wxyz=traj_est[:, [6, 3, 4, 5]],
+                    timestamps=tstamps)
 
-            traj_ref = PoseTrajectory3D(
-                positions_xyz=traj_ref[:,:3],
-                orientations_quat_wxyz=traj_ref[:,3:],
-                timestamps=tstamps)
+                traj_ref_pose = PoseTrajectory3D(
+                    positions_xyz=traj_ref_data[:,:3],
+                    orientations_quat_wxyz=traj_ref_data[:,3:],
+                    timestamps=tstamps)
 
-            # do evaluation
-            ate_score = ate(traj_ref, traj_est)
-            all_results.append(ate_score)
-            results[scene].append(ate_score)
+                # do evaluation
+                ate_score = ate(traj_ref_pose, traj_est)
+                all_results.append(ate_score)
+                results[scene].append(ate_score)
 
-            if plot:
                 scene_name = '_'.join(scene.split('/')[1:]).title() if split == 'validation' else scene
-                Path("trajectory_plots").mkdir(exist_ok=True)
-                plot_trajectory(traj_est, traj_ref, f"TartanAir {scene_name.replace('_', ' ')} Trial #{j+1} (ATE: {ate_score:.03f})",
-                                f"trajectory_plots/TartanAir_{scene_name}_Trial{j+1:02d}.pdf", align=True, correct_scale=True)
 
-            if save:
-                Path("saved_trajectories").mkdir(exist_ok=True)
-                file_interface.write_tum_trajectory_file(f"saved_trajectories/TartanAir_{scene_name}_Trial{j+1:02d}.txt", traj_est)
+                if plot:
+                    Path("trajectory_plots").mkdir(exist_ok=True)
+                    plot_trajectory(
+                        traj_est,
+                        traj_ref_pose,
+                        f"TartanAir {scene_name.replace('_', ' ')} Trial #{j+1} (ATE: {ate_score:.03f})",
+                        f"trajectory_plots/TartanAir_{scene_name}_Trial{j+1:02d}.pdf",
+                        align=True,
+                        correct_scale=True
+                    )
 
-        print(scene, sorted(results[scene]))
+                if save:
+                    Path("saved_trajectories").mkdir(exist_ok=True)
+                    file_interface.write_tum_trajectory_file(
+                        f"saved_trajectories/TartanAir_{scene_name}_Trial{j+1:02d}.txt",
+                        traj_est
+                    )
 
-    results_dict = dict([("Tartan/{}".format(k), np.median(v)) for (k, v) in results.items()])
+            except Exception as e:
+                print(f"[FAIL] scene={scene} trial={j+1}: {type(e).__name__}: {e}")
+                continue
+        if len(results[scene]) > 0:
+            print(scene, sorted(results[scene]))
+        else:
+            print(f"{scene} [] (all trials failed)")
+
+    results_dict = dict([
+        ("Tartan/{}".format(k), np.median(v))
+        for (k, v) in results.items() if len(v) > 0
+    ])
 
     # write output to file with timestamp
     with open(osp.join("TartanAirResults", datetime.datetime.now().strftime('%m-%d-%I%p.txt')), "w") as f:
@@ -136,12 +157,17 @@ def evaluate(config, net, split="validation", trials=1, plot=False, save=False):
 
     xs = []
     for scene in results:
-        x = np.median(results[scene])
-        xs.append(x)
+        if len(results[scene]) > 0:
+            x = np.median(results[scene])
+            xs.append(x)
 
     ates = list(all_results)
-    results_dict["AUC"] = np.maximum(1 - np.array(ates), 0).mean()
-    results_dict["AVG"] = np.mean(xs)
+    if len(ates) > 0:
+        results_dict["AUC"] = np.maximum(1 - np.array(ates), 0).mean()
+        results_dict["AVG"] = np.mean(xs)
+    else:
+        results_dict["AUC"] = float("nan")
+        results_dict["AVG"] = float("nan")
 
     return results_dict
 

@@ -24,6 +24,35 @@ import matplotlib.pyplot as plt
 
 DIM = 384
 
+class LSTMRefiner(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=1e-3)
+        self.x_proj = nn.Linear(dim, 4 * dim)
+        self.h_proj = nn.Linear(dim, 4 * dim)
+
+    def forward(self, x, state=None):
+        x = self.norm(x)
+
+        if state is None:
+            h = torch.zeros_like(x)
+            c = torch.zeros_like(x)
+        else:
+            h, c = state
+
+        gates = self.x_proj(x) + self.h_proj(h)
+        i, f, o, g = gates.chunk(4, dim=-1)
+
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+
+        c = f * c + i * g
+        h = o * torch.tanh(c)
+
+        return h, (h, c)
+
 class Update(nn.Module):
     def __init__(self, p):
         super(Update, self).__init__()
@@ -40,16 +69,12 @@ class Update(nn.Module):
         
         self.norm = nn.LayerNorm(DIM, eps=1e-3)
 
-        self.agg_kk = SoftAgg(DIM)
-        self.agg_ij = SoftAgg(DIM)
+        self.agg_kk = SoftAgg(DIM, temperature=1.1)
+        self.agg_ij = SoftAgg(DIM, temperature=1.1)
 
-        self.gru = nn.Sequential(
-            nn.LayerNorm(DIM, eps=1e-3),
-            GatedResidual(DIM),
-            nn.LayerNorm(DIM, eps=1e-3),
-            GatedResidual(DIM),
-        )
-
+        
+        self.refiner = LSTMRefiner(DIM)
+        
         self.corr = nn.Sequential(
             nn.Linear(2*49*p*p, DIM),
             nn.ReLU(inplace=True),
@@ -71,7 +96,7 @@ class Update(nn.Module):
             nn.Sigmoid())
 
 
-    def forward(self, net, inp, corr, flow, ii, jj, kk):
+    def forward(self, net, inp, corr, flow, ii, jj, kk, state=None):
         """ update operator """
 
         net = net + inp + self.corr(corr)
@@ -87,9 +112,9 @@ class Update(nn.Module):
         net = net + self.agg_kk(net, kk)
         net = net + self.agg_ij(net, ii*12345 + jj)
 
-        net = self.gru(net)
+        net, state = self.refiner(net, state)
 
-        return net, (self.d(net), self.w(net), None)
+        return net, (self.d(net), self.w(net), state)
 
 
 class Patchifier(nn.Module):
@@ -210,7 +235,7 @@ class VONet(nn.Module):
 
         imap = imap.view(b, -1, DIM)
         net = torch.zeros(b, len(kk), DIM, device="cuda", dtype=torch.float)
-        
+        state = None
         Gs = SE3.IdentityLike(poses)
 
         if structure_only:
@@ -236,12 +261,23 @@ class VONet(nn.Module):
                 net1 = torch.zeros(b, len(kk1) + len(kk2), DIM, device="cuda")
                 net = torch.cat([net1, net], dim=1)
 
+                if state is not None:
+                    h, c = state
+                    h1 = torch.zeros(b, len(kk1) + len(kk2), DIM, device=h.device, dtype=h.dtype)
+                    c1 = torch.zeros(b, len(kk1) + len(kk2), DIM, device=c.device, dtype=c.dtype)
+                    h = torch.cat([h1, h], dim=1)
+                    c = torch.cat([c1, c], dim=1)
+                    state = (h, c)
                 if np.random.rand() < 0.1:
                     k = (ii != (n - 4)) & (jj != (n - 4))
                     ii = ii[k]
                     jj = jj[k]
                     kk = kk[k]
-                    net = net[:,k]
+                    net = net[:, k]
+
+                    if state is not None:
+                        h, c = state
+                        state = (h[:, k], c[:, k])
 
                 patches[:,ix==n,2] = torch.median(patches[:,(ix == n-1) | (ix == n-2),2])
                 n = ii.max() + 1
@@ -250,7 +286,7 @@ class VONet(nn.Module):
             coords1 = coords.permute(0, 1, 4, 2, 3).contiguous()
 
             corr = corr_fn(kk, jj, coords1)
-            net, (delta, weight, _) = self.update(net, imap[:,kk], corr, None, ii, jj, kk)
+            net, (delta, weight, state) = self.update(net, imap[:,kk], corr, None, ii, jj, kk, state)
 
             lmbda = 1e-4
             target = coords[...,p//2,p//2,:] + delta

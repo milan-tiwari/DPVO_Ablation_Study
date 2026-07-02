@@ -25,7 +25,8 @@ class DPVO:
         self.is_initialized = False
         self.enable_timing = False
         torch.set_num_threads(2)
-
+        self.recurrent_state = None
+        
         self.M = self.cfg.PATCHES_PER_FRAME
         self.N = self.cfg.BUFFER_SIZE
 
@@ -98,7 +99,7 @@ class DPVO:
                     new_state_dict[k.replace('module.', '')] = v
             
             self.network = VONet()
-            self.network.load_state_dict(new_state_dict)
+            self.network.load_state_dict(new_state_dict, strict=False)
 
         else:
             self.network = network
@@ -163,13 +164,20 @@ class DPVO:
     def m(self, val):
         self.pg.m = val
 
-    def get_pose(self, t):
+    def get_pose(self, t, visited=None):
+        if visited is None:
+            visited = set()
+
+        if t in visited:
+            raise RuntimeError(f"Cyclic pose chain detected at t={t}")
+
+        visited.add(t)
+
         if t in self.traj:
             return SE3(self.traj[t])
 
         t0, dP = self.pg.delta[t]
-        return dP * self.get_pose(t0)
-
+        return dP * self.get_pose(t0, visited)
     def terminate(self):
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
@@ -185,7 +193,7 @@ class DPVO:
         """ interpolate missing poses """
         self.traj = {}
         for i in range(self.n):
-            self.traj[self.pg.tstamps_[i]] = self.pg.poses_[i]
+            self.traj[self.pg.tstamps_[i]] = self.pg.poses_[i]        
 
         poses = [self.get_pose(t) for t in range(self.counter)]
         poses = lietorch.stack(poses, dim=0)
@@ -193,7 +201,7 @@ class DPVO:
         tstamps = np.array(self.tlist, dtype=np.float64)
         if self.viewer is not None:
             self.viewer.join()
-
+        self.recurrent_state = None
         # Poses: x y z qx qy qz qw
         return poses, tstamps
 
@@ -219,7 +227,15 @@ class DPVO:
 
         net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
         self.pg.net = torch.cat([self.pg.net, net], dim=1)
-
+       
+        if self.recurrent_state is not None:
+            h, c = self.recurrent_state
+            h_new = torch.zeros(1, len(ii), self.DIM, device=h.device, dtype=h.dtype)
+            c_new = torch.zeros(1, len(ii), self.DIM, device=c.device, dtype=c.dtype)
+            h = torch.cat([h, h_new], dim=1)
+            c = torch.cat([c, c_new], dim=1)
+            self.recurrent_state = (h, c)
+   
     def remove_factors(self, m, store: bool):
         assert self.pg.ii.numel() == self.pg.weight.shape[1]
         if store:
@@ -235,6 +251,10 @@ class DPVO:
         self.pg.jj = self.pg.jj[~m]
         self.pg.kk = self.pg.kk[~m]
         self.pg.net = self.pg.net[:,~m]
+        if self.recurrent_state is not None:
+            h, c = self.recurrent_state
+            keep = ~m
+            self.recurrent_state = (h[:, keep], c[:, keep])
         assert self.pg.ii.numel() == self.pg.weight.shape[1]
 
     def motion_probe(self):
@@ -250,7 +270,7 @@ class DPVO:
             corr = self.corr(coords, indicies=(kk, jj))
             ctx = self.imap[:,kk % (self.M * self.pmem)]
             net, (delta, weight, _) = \
-                self.network.update(net, ctx, corr, None, ii, jj, kk)
+                self.network.update(net, ctx, corr, None, ii, jj, kk, None)
 
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
@@ -332,8 +352,17 @@ class DPVO:
             with autocast(enabled=True):
                 corr = self.corr(coords)
                 ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
-                self.pg.net, (delta, weight, _) = \
-                    self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
+                self.pg.net, (delta, weight, self.recurrent_state) = \
+                    self.network.update(
+                        self.pg.net,
+                        ctx,
+                        corr,
+                        None,
+                        self.pg.ii,
+                        self.pg.jj,
+                        self.pg.kk,
+                        self.recurrent_state,
+                    )
 
             lmbda = torch.as_tensor([1e-4], device="cuda")
             weight = weight.float()
@@ -441,10 +470,12 @@ class DPVO:
         if self.n > 0 and not self.is_initialized:
             if self.motion_probe() < 2.0:
                 self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])
+                self.recurrent_state = None
                 return
 
         self.n += 1
         self.m += self.M
+        self.recurrent_state = None
 
         if self.cfg.LOOP_CLOSURE:
             if self.n - self.last_global_ba >= self.cfg.GLOBAL_OPT_FREQ:
@@ -460,13 +491,14 @@ class DPVO:
 
         if self.n == 8 and not self.is_initialized:
             self.is_initialized = True
-
+            self.recurrent_state = None
+            
             for itr in range(12):
                 self.update()
 
         elif self.is_initialized:
-            self.update()
-            self.keyframe()
+             self.update()
+             self.keyframe()
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc.attempt_loop_closure(self.n)

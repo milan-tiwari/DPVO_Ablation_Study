@@ -29,44 +29,46 @@ class GatedResidual(nn.Module):
         return x + self.gate(x) * self.res(x)
 
 class SoftAgg(nn.Module):
-    def __init__(self, dim=512, expand=True):
+    def __init__(self, dim=512, expand=True, temperature=1.0):
         super(SoftAgg, self).__init__()
         self.dim = dim
         self.expand = expand
+        self.temperature = temperature
         self.f = nn.Linear(self.dim, self.dim)
         self.g = nn.Linear(self.dim, self.dim)
         self.h = nn.Linear(self.dim, self.dim)
 
     def forward(self, x, ix):
         _, jx = torch.unique(ix, return_inverse=True)
-        w = torch_scatter.scatter_softmax(self.g(x), jx, dim=1)
+        logits = self.g(x) / self.temperature
+        w = torch_scatter.scatter_softmax(logits, jx, dim=1)
         y = torch_scatter.scatter_sum(self.f(x) * w, jx, dim=1)
 
         if self.expand:
-            return self.h(y)[:,jx]
-            
+            return self.h(y)[:, jx]
+
         return self.h(y)
 
 class SoftAggBasic(nn.Module):
-    def __init__(self, dim=512, expand=True):
+    def __init__(self, dim=512, expand=True, temperature=1.0):
         super(SoftAggBasic, self).__init__()
         self.dim = dim
         self.expand = expand
+        self.temperature = temperature
         self.f = nn.Linear(self.dim, self.dim)
-        self.g = nn.Linear(self.dim,        1)
+        self.g = nn.Linear(self.dim, 1)
         self.h = nn.Linear(self.dim, self.dim)
 
     def forward(self, x, ix):
         _, jx = torch.unique(ix, return_inverse=True)
-        w = torch_scatter.scatter_softmax(self.g(x), jx, dim=1)
+        logits = self.g(x) / self.temperature
+        w = torch_scatter.scatter_softmax(logits, jx, dim=1)
         y = torch_scatter.scatter_sum(self.f(x) * w, jx, dim=1)
 
         if self.expand:
-            return self.h(y)[:,jx]
-            
+            return self.h(y)[:, jx]
+
         return self.h(y)
-
-
 ### Gradient Clipping and Zeroing Operations ###
 
 GRAD_CLIP = 0.1
