@@ -112,3 +112,11 @@ Those artifacts were excluded to keep the repository lightweight and portable.
 ### Baseline Evaluation
 ```bash
 python evaluate_tartan.py --split=test --trials=1 --plot --save_trajectory
+
+## Contributors
+
+This project was developed collaboratively by Milan Tiwari and Kareena Lakhani
+as part of coursework and research on monocular visual odometry. The work covered
+baseline reproduction on ASU Sol HPC, architectural ablations (ConvLSTM-style
+temporal refinement and temperature-scaled softmax aggregation), and
+evaluation-harness robustness improvements across the TartanAir and EuRoC benchmarks.
